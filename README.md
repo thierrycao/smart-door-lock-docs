@@ -103,17 +103,93 @@ cd smart-door-lock
 
 ### 2.4 分区布局
 
-分区单一可信源为 `apps/smart-door-lock/res/partitions.yaml`。构建阶段由 `apps/smart-door-lock/partitions.cmake` 生成 `build/partitions/partitions_auto.conf`。
+分区单一可信源为 `apps/smart-door-lock/res/partitions.yaml`。构建阶段由 `apps/smart-door-lock/partitions.cmake` 生成 `build/partitions/partitions_auto.conf`；CP 运行时内存布局来自 `build/linker.ld`，当前静态占用可用 `size -A build/smart-door-lock` 和 `nm -S --size-sort build/smart-door-lock` 复核。
+
+#### Flash 镜像分区
 
 | 分区 | Offset | Size | 用途 |
 |---|---:|---:|---|
-| `boot` | `0x000000` | `0x040000` | Bootloader |
-| `ap` | `0x040000` | `0x0C0000` | AP 固件，承载算法侧服务 |
-| `face_* 模型` | `0x100000` 起 | `0x400000` | FD 检测、对齐、活体、比对模型 |
-| `wakeup_algo` / `wakeup_wrap` | `0x4A0000` / `0x600000` | `0x160000` / `0x200000` | 唤醒算法和配置资源 |
-| `cp` | `0x800000` | `0x300000` | CP 主业务固件 |
-| `tone` | `0xB00000` | `0x100000` | 离线提示音资源 |
-| `face_registry` | `0xC00000` | `0x010000` | 人脸注册数据，A/B 槽保存 |
+| `boot` | `0x000000` | `0x040000` / 256 KB | Bootloader，引导 AP / CP / 资源加载。 |
+| `ap` | `0x040000` | `0x0C0000` / 768 KB | AP 固件，承载人脸和唤醒算法侧服务。 |
+| `face_detect_thinker` | `0x100000` | `0x070000` / 448 KB | 人脸检测模型资源。 |
+| `face_align_thinker` | `0x170000` | `0x090000` / 576 KB | 人脸对齐模型资源。 |
+| `face_nir_thinker` | `0x200000` | `0x0C0000` / 768 KB | NIR 活体检测模型资源。 |
+| `face_verify_thinker` | `0x2C0000` | `0x1E0000` / 1.875 MB | 人脸特征提取和比对模型资源。 |
+| `wakeup_algo` | `0x4A0000` | `0x160000` / 1.375 MB | 离线唤醒算法资源。 |
+| `wakeup_wrap` | `0x600000` | `0x200000` / 2 MB | 唤醒词、命令词和算法配置资源。 |
+| `cp` | `0x800000` | `0x300000` / 3 MB | CP 主业务固件，包含应用逻辑、UI、摄像头、消息总线等。 |
+| `tone` | `0xB00000` | `0x100000` / 1 MB | 离线提示音资源。 |
+| `face_registry` | `0xC00000` | `0x010000` / 64 KB | 人脸注册数据，A/B 槽保存。 |
+| `easyflash` | `0xF00000` | `0x002000` / 8 KB | EasyFlash ENV 存储区。 |
+| `nvds` | `0xFF8000` | `0x008000` / 32 KB | 底层 NVDS / RF 校准数据区。 |
+
+#### SRAM 运行时分区布局
+
+SRAM 表只列芯片内部 RAM 和 CP/AP 共享 RAM，不包含 Flash XIP 映射区。
+
+| 区域 | 起始地址 | Size | 当前用途 |
+|---|---:|---:|---|
+| `SRAM` | `0x20010000` | `0x024800` / 146 KB | CP 侧内部 SRAM，放 fast text/data/bss、默认 heap、stack 等实时性更敏感的数据。 |
+| `ILM` | `0x00280000` | `0x004000` / 16 KB | 指令紧耦合内存，用于中断、低延迟或关键路径代码。 |
+| `DLM` | `0x00300000` | `0x002000` / 8 KB | 数据紧耦合内存，当前包含 DMA 链表等低延迟数据。 |
+| `APRAM` | `0x20050000` | `0x060000` / 384 KB | AP / 算法侧运行 RAM 保留区；FD、wakeup 的 AP 内部分配由 AP 固件管理。 |
+| `IPC_RAM` | `0x2004E000` | `0x002000` / 8 KB | CP 与 AP 的 IPC 共享通信区，当前 `ipc_shared_env` 约 5.6 KB。 |
+| `LUNA_RAM` | `0x20048000` | `0x006000` / 24 KB | LUNA 共享内存。 |
+| `LUNA_PRIV_RAM` | `0x200B0000` | `0x006000` / 24 KB | LUNA 私有内存。 |
+| `BTRAM` | `0x200C0000` | `0x006000` / 24 KB | 蓝牙 RAM / BT heap 区。 |
+| `WIFI_RAM` | `0x20000000` | `0x010000` / 64 KB | Wi-Fi 运行 RAM；linker 里对 Wi-Fi 共享区有 256 KB 边界断言，实际以芯片内存规划和 SDK 配置为准。 |
+
+#### CP SRAM 段使用情况
+
+| 段 | 起始地址 | 结束地址 | 大小 | 当前用途 |
+|---|---:|---:|---:|---|
+| `.fast.text` | `0x20010000` | `0x20017470` | 约 29.1 KB | 放在 SRAM 中执行的快速代码。 |
+| `.fast.rodata` | `0x20017470` | `0x20017478` | 8 B | 快速只读数据。 |
+| `.fast.bss` | `0x20017480` | `0x200180C0` | 约 3.1 KB | 快速 BSS。 |
+| `.data` | `0x200180C0` | `0x2001A27C` | 约 8.4 KB | 已初始化全局数据。 |
+| `.bss` | `0x2001A400` | `0x2002BF5C` | 约 70.8 KB | 未初始化全局数据，包含部分系统对象和默认堆元数据。 |
+| `.noinit` | `0x2002BF5C` | `0x20031D5C` | 约 23.5 KB | 不清零数据区，当前包含 `default_heap` 等。 |
+| `.heapstack` | `0x20031D60` | `0x20032F60` | 约 4.5 KB | CP 默认 heap / stack 保留区。 |
+
+#### PSRAM 运行时分区布局
+
+| 段 / 区域 | 起始地址 | 结束地址 | 大小 | 当前用途 |
+|---|---:|---:|---:|---|
+| `PSRAM` 总区间 | `0x28800000` | `0x29000000` | 8 MB | CP 侧外部大内存。 |
+| `.psram.data` | `0x28800000` | `0x28800060` | 96 B | 放入 PSRAM 的已初始化数据。 |
+| `.psram.bss` | `0x28800060` | `0x289061D8` | 约 1.02 MB | PSRAM BSS，包含 `lvgl_port_mem`、`s_face_registry` 等静态对象。 |
+| `.psram.noinit` | `0x289061D8` | `0x28E061D8` | 5 MB | PSRAM 默认动态堆 `psram_default_heap`。 |
+| `.wifi_la_dump` | `0x28E061D8` | `0x28E0E1D8` | 32 KB | Wi-Fi dump / logic analyzer 缓存。 |
+| `.psram.text` | `0x28E0E1D8` | `0x28E38388` | 约 168.4 KB | 放入 PSRAM 的代码段。 |
+| `.bt_heap` | `0x28E38390` | `0x28E3E390` | 24 KB | 蓝牙 heap。 |
+| 未静态占用余量 | `0x28E3E390` | `0x29000000` | 约 1.76 MB | 留给对齐间隙、运行时动态缓存和后续扩展；实际可用量以 heap 统计和运行时日志为准。 |
+
+#### PSRAM 关键静态对象
+
+| 占用项 | 大小 | 来源 / 说明 |
+|---|---:|---|
+| `psram_default_heap` | 5 MB | 默认 PSRAM 动态堆，供 `psram_malloc*`、部分 SDK 组件和大块运行时缓存使用。 |
+| `lvgl_port_mem` | 1 MB | LVGL 内存池，页面对象、控件状态和部分 UI 资源从这里分配。 |
+| `.psram.text` | 约 168 KB | 放入 PSRAM 的代码段。 |
+| `.psram.bss` | 约 1.02 MB | PSRAM BSS，包含 LVGL 池、人脸注册缓存等静态对象。 |
+| `s_face_registry` | 约 15 KB | CP 侧人脸注册特征缓存。 |
+| `parser_data_buf` | 4 KB | 协议解析缓存。 |
+| `.wifi_la_dump` | 32 KB | Wi-Fi dump / logic analyzer 缓存。 |
+| `.bt_heap` | 24 KB | 蓝牙 heap。 |
+
+#### 主要功能的动态内存
+
+| 功能 | 分配方式 | 当前配置下的占用 |
+|---|---|---:|
+| 摄像头共享帧池 | `dl_camera.c` 使用 `lisa_mem_align_alloc(32, 640 * 480 * 2 * 3)` 申请最大帧池。 | 约 1.76 MB |
+| FACE IR 输入帧 | `dl_camera_profile.c` 配置 `320x240 YUV422`。 | 单帧约 150 KB |
+| FD 输入缓存 | `face_fd_sink.c` 按 `width * height * 2` 申请，FACE IR 当前为 `320 * 240 * 2`。 | 约 150 KB |
+| UI 摄像头预览双缓冲 | `ui_preview.c` 按 `display_width * display_height * 2 * 2` 申请 RGB565 双缓冲。 | 320x240 时约 300 KB |
+| LVGL 页面与控件 | 从 `lvgl_port_mem` 池分配。 | 共享 1 MB LVGL 池 |
+| 人脸注册数据 | 运行时缓存约 15 KB，落盘写入 `face_registry` 64 KB Flash 分区。 | 约 15 KB RAM + 64 KB Flash |
+| AP FD / wakeup 算法运行内存 | AP 固件内部管理，CP 仓库未暴露模块级 map。 | 不能从当前仓库精确拆分 |
+
+CP 负责业务逻辑、UI、摄像头采集、注册数据管理和消息路由；AP 负责 FD、活体、特征比对、wakeup 等算法服务。CP 与 AP 通过 IPC 共享区和 ACOMP 服务交互，算法模型和 wakeup 资源位于 Flash 分区，AP 私有运行时内存需要 AP 固件 map 或运行时内存日志才能进一步拆到单个算法模块。
 
 ## 3. 分层架构
 
